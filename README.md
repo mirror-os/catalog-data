@@ -106,7 +106,7 @@ Timestamps and row counts for each catalog source.
 
 ## Release Artifacts
 
-Each weekly CI run attaches these files to the `catalog-latest` GitHub Release:
+Each daily CI run attaches these files to the `catalog-latest` GitHub Release:
 
 | File | Description |
 |------|-------------|
@@ -116,9 +116,10 @@ Each weekly CI run attaches these files to the `catalog-latest` GitHub Release:
 
 The archives extract directly into `~/.local/share/mirror-os/media/` with the correct folder structure.
 
-## Bootstrap Integration
-
-On a new Mirror OS install, `mirror-catalog-bootstrap` downloads these release artifacts before the catalog update timer runs, so the Software Center is populated immediately without a 30+ minute local build.
+> **Note:** The Mirror OS image is built daily and ships `catalog.db` and icons
+> directly at `/usr/share/mirror-os/`. On first login, `mirror-catalog-bootstrap`
+> seeds the user's data directory from there — no network download required.
+> The release artifacts here are for **analysis and development** use only.
 
 ## Update Schedule
 
