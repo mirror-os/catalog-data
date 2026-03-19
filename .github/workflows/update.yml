@@ -1,0 +1,178 @@
+name: Update Catalog
+
+on:
+  schedule:
+    # Every Monday at 02:00 UTC (a few hours before the image build on Mondays)
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout catalog-data
+        uses: actions/checkout@v4
+        with:
+          path: catalog-data
+
+      - name: Checkout main repo (for mirror-catalog-update script)
+        uses: actions/checkout@v4
+        with:
+          repository: mirror-os/main
+          path: mirror-os-main
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            flatpak \
+            python3 \
+            zstd \
+            sqlite3
+
+      - name: Add Flathub remote (system scope)
+        run: |
+          sudo flatpak remote-add --system --if-not-exists flathub \
+            https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      - name: Download Flathub AppStream cache (XML + icon cache)
+        run: |
+          # Downloads appstream.xml.gz + icons/ for all Flathub apps.
+          # No apps are installed; this just fetches the catalog metadata.
+          sudo flatpak update --appstream --noninteractive 2>&1 | tail -5
+          echo "AppStream cache size:"
+          du -sh /var/lib/flatpak/appstream/flathub/x86_64/active/
+
+      - name: Build catalog database
+        run: |
+          export HOME=/tmp/catalog-work
+          mkdir -p "$HOME/.local/share/mirror-os"
+
+          # Copy the update script from the main repo
+          cp mirror-os-main/files/usr/libexec/mirror-os/mirror-catalog-update /tmp/mirror-catalog-update
+          chmod +x /tmp/mirror-catalog-update
+
+          # Run Phase 1 only (--no-media skips Phase 2 network downloads).
+          # Phase 1 reads the AppStream XML and copies icons from the AppStream
+          # icon cache already downloaded above — no extra network calls needed.
+          /tmp/mirror-catalog-update --source flatpak --no-media
+
+          echo ""
+          echo "=== Catalog summary ==="
+          python3 - "$HOME/.local/share/mirror-os/catalog.db" << 'EOF'
+          import sqlite3, sys
+          conn = sqlite3.connect(sys.argv[1])
+          for source, updated_at, row_count in conn.execute(
+              "SELECT source, updated_at, row_count FROM catalog_meta ORDER BY source"
+          ):
+              print(f"  {source}: {row_count} rows (updated {updated_at})")
+          icons_present = conn.execute(
+              "SELECT count(*) FROM flatpak_apps WHERE icon_local_path != ''"
+          ).fetchone()[0]
+          total = conn.execute("SELECT count(*) FROM flatpak_apps").fetchone()[0]
+          print(f"  icons cached: {icons_present}/{total}")
+          conn.close()
+          EOF
+
+      - name: Package artifacts
+        run: |
+          export HOME=/tmp/catalog-work
+          MEDIA_DIR="$HOME/.local/share/mirror-os/media"
+          CATALOG_DB="$HOME/.local/share/mirror-os/catalog.db"
+          OUT=/tmp/artifacts
+          mkdir -p "$OUT"
+
+          # catalog.db — copy as-is (portable: icon_local_path values will be
+          # machine-specific but mirror-catalog-bootstrap resets them on install)
+          cp "$CATALOG_DB" "$OUT/catalog.db"
+          echo "catalog.db: $(du -sh "$OUT/catalog.db" | cut -f1)"
+
+          # icons.tar.zst — extract with: tar -x --zstd -f icons.tar.zst -C ~/.local/share/mirror-os/media/
+          if [ -d "$MEDIA_DIR/icons" ] && [ "$(ls -A "$MEDIA_DIR/icons" 2>/dev/null)" ]; then
+            tar -C "$MEDIA_DIR" --zstd -cf "$OUT/icons.tar.zst" icons/
+            echo "icons.tar.zst: $(du -sh "$OUT/icons.tar.zst" | cut -f1) ($(ls "$MEDIA_DIR/icons" | wc -l) icons)"
+          else
+            # Create an empty archive as a placeholder
+            mkdir -p /tmp/empty-icons/icons
+            tar -C /tmp/empty-icons --zstd -cf "$OUT/icons.tar.zst" icons/
+            echo "icons.tar.zst: empty placeholder (no icons cached)"
+          fi
+
+          # screenshots.tar.zst — Phase 2 is skipped in CI, so this is a
+          # placeholder. A live export via scripts/export-from-live.sh includes
+          # real screenshots.
+          mkdir -p /tmp/empty-ss/screenshots
+          tar -C /tmp/empty-ss --zstd -cf "$OUT/screenshots.tar.zst" screenshots/
+          echo "screenshots.tar.zst: placeholder (screenshots not downloaded in CI)"
+
+          echo ""
+          echo "=== Artifact sizes ==="
+          ls -lh "$OUT/"
+
+      - name: Commit catalog.db to repository
+        run: |
+          cp /tmp/artifacts/catalog.db catalog-data/catalog.db
+
+          cd catalog-data
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add catalog.db
+          if git diff --cached --quiet; then
+            echo "No changes to catalog.db — skipping commit."
+          else
+            git commit -m "catalog: weekly update $(date -u '+%Y-%m-%d')"
+            git push
+          fi
+
+      - name: Delete old rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd catalog-data
+          gh release delete catalog-latest --yes 2>/dev/null || true
+          git push origin :refs/tags/catalog-latest 2>/dev/null || true
+
+      - name: Create rolling release (catalog-latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DATE=$(date -u '+%Y-%m-%d')
+          cd catalog-data
+          gh release create catalog-latest \
+            --title "Catalog Data — latest (${DATE})" \
+            --notes "$(cat <<EOF
+          Weekly snapshot updated ${DATE}.
+
+          ## Artifacts
+
+          | File | Description |
+          |------|-------------|
+          | \`catalog.db\` | SQLite catalog database (Flatpak apps + Nix packages) |
+          | \`icons.tar.zst\` | App icons — extract into \`~/.local/share/mirror-os/media/\` |
+          | \`screenshots.tar.zst\` | Screenshots — extract into \`~/.local/share/mirror-os/media/\` |
+
+          Used by \`mirror-catalog-bootstrap\` on new Mirror OS installs.
+          EOF
+          )" \
+            --latest \
+            /tmp/artifacts/catalog.db \
+            /tmp/artifacts/icons.tar.zst \
+            /tmp/artifacts/screenshots.tar.zst
+
+      - name: Create dated release for history
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DATE=$(date -u '+%Y-%m-%d')
+          cd catalog-data
+          gh release create "catalog-${DATE}" \
+            --title "Catalog Data — ${DATE}" \
+            --notes "Weekly snapshot ${DATE}." \
+            /tmp/artifacts/catalog.db \
+            /tmp/artifacts/icons.tar.zst \
+            /tmp/artifacts/screenshots.tar.zst
