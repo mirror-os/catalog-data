@@ -1,9 +1,13 @@
 name: Update Catalog
 
 on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '*.md'
+      - 'queries/**'
   schedule:
-    # Every day at 02:00 UTC
-    - cron: '0 2 * * *'
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 permissions:
