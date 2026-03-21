@@ -12,7 +12,7 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout catalog-data
@@ -48,6 +48,22 @@ jobs:
           echo "AppStream cache size:"
           du -sh /var/lib/flatpak/appstream/flathub/x86_64/active/
 
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v14
+
+      # Compute week number for nix-icon cache key (YYYY-WW).
+      - name: Compute week number
+        id: week
+        run: echo "week=$(date -u '+%Y-%W')" >> "$GITHUB_OUTPUT"
+
+      # Restore nix-icon incremental state across builds.
+      # Includes nix-index-database (~92 MB) and state.json (which packages are done).
+      - name: Restore nix-icon cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/catalog-work/.local/share/mirror-os/media/.nix-icon-cache
+          key: nix-icon-cache-${{ steps.week.outputs.week }}
+
       - name: Build catalog database
         run: |
           export HOME=/tmp/catalog-work
@@ -57,25 +73,48 @@ jobs:
           cp mirror-os-main/files/usr/libexec/mirror-os/mirror-catalog-update /tmp/mirror-catalog-update
           chmod +x /tmp/mirror-catalog-update
 
-          # Run Phase 1 only (--no-media skips Phase 2 network downloads).
-          # Phase 1 reads the AppStream XML and copies icons from the AppStream
-          # icon cache already downloaded above — no extra network calls needed.
-          /tmp/mirror-catalog-update --source flatpak --no-media
+          # Build the full catalog (Flatpak + Nix + nix-meta + app_map).
+          # --build: run full local build (not the download-from-release mode).
+          # --no-media: skip Flatpak screenshot/icon downloads (icons come from
+          #   AppStream cache + nix-icons.py instead).
+          # hm-options is skipped automatically (no HM flake in CI).
+          /tmp/mirror-catalog-update --build --source all --no-media
 
-          echo ""
-          echo "=== Catalog summary ==="
-          python3 - "$HOME/.local/share/mirror-os/catalog.db" << 'EOF'
+      - name: Extract Nix icons
+        run: |
+          nix profile install nixpkgs#nix-index
+          python3 catalog-data/scripts/nix-icons.py \
+            --db /tmp/catalog-work/.local/share/mirror-os/catalog.db \
+            --media-dir /tmp/catalog-work/.local/share/mirror-os/media
+
+      - name: Clear build-time icon paths
+        run: |
+          python3 - /tmp/catalog-work/.local/share/mirror-os/catalog.db << 'EOF'
+          import sqlite3, sys
+          conn = sqlite3.connect(sys.argv[1], timeout=30)
+          with conn:
+              conn.execute("UPDATE flatpak_apps SET icon_local_path = ''")
+              try: conn.execute("UPDATE nix_packages SET icon_local_path = ''")
+              except Exception: pass
+          conn.close()
+          EOF
+
+      - name: Print catalog summary
+        run: |
+          python3 - /tmp/catalog-work/.local/share/mirror-os/catalog.db << 'EOF'
           import sqlite3, sys
           conn = sqlite3.connect(sys.argv[1])
+          print("=== Catalog summary ===")
           for source, updated_at, row_count in conn.execute(
               "SELECT source, updated_at, row_count FROM catalog_meta ORDER BY source"
           ):
               print(f"  {source}: {row_count} rows (updated {updated_at})")
-          icons_present = conn.execute(
-              "SELECT count(*) FROM flatpak_apps WHERE icon_local_path != ''"
-          ).fetchone()[0]
-          total = conn.execute("SELECT count(*) FROM flatpak_apps").fetchone()[0]
-          print(f"  icons cached: {icons_present}/{total}")
+          for table, label in [("flatpak_apps", "Flatpak"), ("nix_packages", "Nix")]:
+              try:
+                  total = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                  print(f"  {label} total: {total}")
+              except Exception:
+                  pass
           conn.close()
           EOF
 
@@ -87,28 +126,18 @@ jobs:
           OUT=/tmp/artifacts
           mkdir -p "$OUT"
 
-          # catalog.db — copy as-is (portable: icon_local_path values will be
-          # machine-specific but mirror-catalog-bootstrap resets them on install)
           cp "$CATALOG_DB" "$OUT/catalog.db"
           echo "catalog.db: $(du -sh "$OUT/catalog.db" | cut -f1)"
 
-          # icons.tar.zst — extract with: tar -x --zstd -f icons.tar.zst -C ~/.local/share/mirror-os/media/
+          # icons.tar.zst — Flatpak icons (from AppStream cache) + Nix icons (from NARs)
           if [ -d "$MEDIA_DIR/icons" ] && [ "$(ls -A "$MEDIA_DIR/icons" 2>/dev/null)" ]; then
             tar -C "$MEDIA_DIR" --zstd -cf "$OUT/icons.tar.zst" icons/
             echo "icons.tar.zst: $(du -sh "$OUT/icons.tar.zst" | cut -f1) ($(ls "$MEDIA_DIR/icons" | wc -l) icons)"
           else
-            # Create an empty archive as a placeholder
             mkdir -p /tmp/empty-icons/icons
             tar -C /tmp/empty-icons --zstd -cf "$OUT/icons.tar.zst" icons/
             echo "icons.tar.zst: empty placeholder (no icons cached)"
           fi
-
-          # screenshots.tar.zst — Phase 2 is skipped in CI, so this is a
-          # placeholder. A live export via scripts/export-from-live.sh includes
-          # real screenshots.
-          mkdir -p /tmp/empty-ss/screenshots
-          tar -C /tmp/empty-ss --zstd -cf "$OUT/screenshots.tar.zst" screenshots/
-          echo "screenshots.tar.zst: placeholder (screenshots not downloaded in CI)"
 
           echo ""
           echo "=== Artifact sizes ==="
@@ -125,7 +154,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to catalog.db — skipping commit."
           else
-            git commit -m "catalog: weekly update $(date -u '+%Y-%m-%d')"
+            git commit -m "catalog: update $(date -u '+%Y-%m-%d')"
             git push
           fi
 
@@ -145,24 +174,22 @@ jobs:
           cd catalog-data
           gh release create catalog-latest \
             --title "Catalog Data — latest (${DATE})" \
-            --notes "$(cat <<EOF
-          Weekly snapshot updated ${DATE}.
+            --notes "$(cat <<'NOTES'
+          Daily catalog snapshot.
 
           ## Artifacts
 
           | File | Description |
           |------|-------------|
-          | \`catalog.db\` | SQLite catalog database (Flatpak apps + Nix packages) |
-          | \`icons.tar.zst\` | App icons — extract into \`~/.local/share/mirror-os/media/\` |
-          | \`screenshots.tar.zst\` | Screenshots — extract into \`~/.local/share/mirror-os/media/\` |
+          | `catalog.db` | SQLite catalog (Flatpak apps + Nix packages + app_map) |
+          | `icons.tar.zst` | App icons (Flatpak + Nix) |
 
-          Used by \`mirror-catalog-bootstrap\` on new Mirror OS installs.
-          EOF
+          Downloaded by `mirror-catalog-update` on user devices and by the Mirror OS image build.
+          NOTES
           )" \
             --latest \
             /tmp/artifacts/catalog.db \
-            /tmp/artifacts/icons.tar.zst \
-            /tmp/artifacts/screenshots.tar.zst
+            /tmp/artifacts/icons.tar.zst
 
       - name: Create dated release for history
         env:
@@ -172,7 +199,6 @@ jobs:
           cd catalog-data
           gh release create "catalog-${DATE}" \
             --title "Catalog Data — ${DATE}" \
-            --notes "Weekly snapshot ${DATE}." \
+            --notes "Daily snapshot ${DATE}." \
             /tmp/artifacts/catalog.db \
-            /tmp/artifacts/icons.tar.zst \
-            /tmp/artifacts/screenshots.tar.zst
+            /tmp/artifacts/icons.tar.zst
