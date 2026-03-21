@@ -201,6 +201,8 @@ jobs:
         run: |
           DATE=$(date -u '+%Y-%m-%d')
           cd catalog-data
+          gh release delete "catalog-${DATE}" --yes 2>/dev/null || true
+          git push origin ":refs/tags/catalog-${DATE}" 2>/dev/null || true
           gh release create "catalog-${DATE}" \
             --title "Catalog Data — ${DATE}" \
             --notes "Daily snapshot ${DATE}." \
