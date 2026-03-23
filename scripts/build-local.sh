@@ -70,8 +70,8 @@ if [[ "$SOURCE" == nix-icons ]]; then
     python3 "$REPO_ROOT/scripts/nix-icons.py" --db "$CATALOG_DB" --media-dir "$MEDIA_DIR"
 else
     chmod +x "$UPDATE_SCRIPT"
-    echo "Running mirror-catalog-update --source $SOURCE --no-media..."
-    HOME="$BUILD_HOME" "$UPDATE_SCRIPT" --source "$SOURCE" --no-media
+    echo "Running mirror-catalog-update --build --source $SOURCE --no-media..."
+    HOME="$BUILD_HOME" "$UPDATE_SCRIPT" --build --source "$SOURCE" --no-media
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
